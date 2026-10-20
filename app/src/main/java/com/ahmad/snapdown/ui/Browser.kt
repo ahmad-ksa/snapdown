@@ -66,6 +66,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.ahmad.snapdown.Choice
@@ -102,6 +104,22 @@ val browserSites = listOf(
     "Vimeo" to "https://vimeo.com",
 )
 
+private const val CODEC_FIX_JS = """
+(function(){
+  if (window.__sdCodecFix) return; window.__sdCodecFix = true;
+  var bad = /hev1|hvc1|hevc|h265|bytevc1|dvh1|dvhe|av01/i;
+  try { if (window.MediaSource) { var ist = MediaSource.isTypeSupported.bind(MediaSource);
+    MediaSource.isTypeSupported = function(t){ return bad.test(t) ? false : ist(t); }; } } catch(e){}
+  try { var cpt = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function(t){ return bad.test(t) ? '' : cpt.call(this, t); }; } catch(e){}
+  try { if (navigator.mediaCapabilities) { var di = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+    navigator.mediaCapabilities.decodingInfo = function(c){
+      var ct = (c && c.video && c.video.contentType) || '';
+      if (bad.test(ct)) return Promise.resolve({supported:false, smooth:false, powerEfficient:false});
+      return di(c); }; } } catch(e){}
+})();
+"""
+
 /** Creates the WebView once; it survives tab switches so playback/page state is kept. */
 @SuppressLint("SetJavaScriptEnabled")
 fun BrowserState.obtainWebView(activity: Activity): WebView {
@@ -118,6 +136,12 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
     CookieManager.getInstance().setAcceptCookie(true)
     CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
+    // Many phones' WebView plays HEVC/AV1 audio but can't draw the frames (gray video on TikTok).
+    // Hide those codecs so sites fall back to H.264, which renders everywhere.
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+        WebViewCompat.addDocumentStartJavaScript(wv, CODEC_FIX_JS, setOf("*"))
+    }
+
     wv.webViewClient = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val scheme = request.url.scheme ?: return true
@@ -127,6 +151,9 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             this@obtainWebView.url = url
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                view.evaluateJavascript(CODEC_FIX_JS, null)
+            }
         }
 
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
@@ -146,6 +173,9 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
     wv.webChromeClient = object : WebChromeClient() {
         override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress }
         override fun onReceivedTitle(view: WebView, t: String?) { title = t ?: "" }
+
+        // no gray "play" placeholder while a video loads
+        override fun getDefaultVideoPoster(): Bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
 
         // full-screen video playback
         override fun onShowCustomView(view: View, callback: CustomViewCallback) {
