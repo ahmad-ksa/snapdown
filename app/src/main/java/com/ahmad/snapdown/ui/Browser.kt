@@ -85,7 +85,7 @@ class BrowserState {
 
     /** Opens a link in the in-app browser (works before the WebView exists too). */
     fun open(link: String) {
-        webView?.loadUrl(link) ?: run { pending = link }
+        webView?.let { navigate(it, link) } ?: run { pending = link }
     }
 
     internal fun takePending(): String? = pending.also { pending = null }
@@ -146,7 +146,12 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val scheme = request.url.scheme ?: return true
             // block "open in app" redirects (intent://, vnd.youtube:// …) — stay in the browser
-            return scheme != "http" && scheme != "https"
+            if (scheme != "http" && scheme != "https") return true
+            // entering/leaving TikTok needs a different user agent → reload with the right one
+            if (request.isForMainFrame && applyUserAgent(view, request.url.toString())) {
+                view.loadUrl(request.url.toString()); return true
+            }
+            return false
         }
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
@@ -200,9 +205,32 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
             activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
-    wv.loadUrl(takePending() ?: browserSites.first().second)
+    navigate(wv, takePending() ?: browserSites.first().second)
     webView = wv
     return wv
+}
+
+private const val DESKTOP_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+/**
+ * TikTok's mobile website shows a gray video on many phones and blocks scrolling after a few
+ * videos ("open in the app"). Its desktop website has neither problem, so TikTok gets a desktop UA.
+ * Returns true when the user agent was changed.
+ */
+fun applyUserAgent(view: WebView, url: String): Boolean {
+    val wantDesktop = Engine.hostOf(url).endsWith("tiktok.com")
+    val ua = if (wantDesktop) DESKTOP_UA else null
+    val current = view.settings.userAgentString
+    val isDesktop = current == DESKTOP_UA
+    if (wantDesktop == isDesktop) return false
+    view.settings.userAgentString = ua
+    return true
+}
+
+fun navigate(view: WebView, url: String) {
+    applyUserAgent(view, url)
+    view.loadUrl(url)
 }
 
 /** Whether the page currently open is something worth downloading. */
@@ -250,7 +278,7 @@ fun BrowserScreen(activity: Activity, state: BrowserState, snackbar: SnackbarHos
                     browserSites.forEach { (name, link) ->
                         FilterChip(
                             selected = baseDomain(state.url) == baseDomain(link),
-                            onClick = { state.webView?.loadUrl(link) },
+                            onClick = { state.webView?.let { navigate(it, link) } },
                             label = { Text(name) }
                         )
                     }
