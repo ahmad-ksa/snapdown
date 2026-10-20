@@ -13,6 +13,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.ahmad.snapdown.ui.BrowserState
 import com.ahmad.snapdown.ui.SnapDownApp
 
 class MainActivity : ComponentActivity() {
@@ -23,7 +24,10 @@ class MainActivity : ComponentActivity() {
     /** A link currently in the clipboard (offered to the user). */
     val clipUrl = mutableStateOf<String?>(null)
 
+    /** 0 = browser (YouTube…), 1 = paste link, 2 = downloads */
     val tab = mutableIntStateOf(0)
+
+    val browser = BrowserState()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,7 +46,7 @@ class MainActivity : ComponentActivity() {
         if (intent.action == Intent.ACTION_SEND) {
             extractUrl(intent.getStringExtra(Intent.EXTRA_TEXT))?.let {
                 sharedUrl.value = it
-                tab.intValue = 0
+                tab.intValue = TAB_LINK
             }
         }
         if (intent.hasExtra(EXTRA_TAB)) tab.intValue = intent.getIntExtra(EXTRA_TAB, 0)
@@ -75,6 +79,9 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_TAB = "tab"
+        const val TAB_BROWSER = 0
+        const val TAB_LINK = 1
+        const val TAB_DOWNLOADS = 2
         private val urlRegex = Regex("""https?://[^\s"'<>]+""")
         fun extractUrl(text: String?): String? = text?.let { urlRegex.find(it)?.value?.trimEnd('.', ',', ')') }
     }

@@ -61,7 +61,7 @@ class DownloadService : Service() {
 
     private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
         this, 0,
-        Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, 1),
+        Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, MainActivity.TAB_DOWNLOADS),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
 

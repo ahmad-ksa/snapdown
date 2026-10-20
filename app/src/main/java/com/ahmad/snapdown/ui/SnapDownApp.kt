@@ -38,6 +38,9 @@ import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SmartDisplay
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -106,6 +109,7 @@ private sealed interface HomeState {
     data class Loading(val url: String) : HomeState
     data class Loaded(val info: MediaInfo) : HomeState
     data class Error(val url: String, val message: String) : HomeState
+    data class Playlist(val url: String) : HomeState
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -133,11 +137,15 @@ fun SnapDownApp(activity: MainActivity) {
             bottomBar = {
                 NavigationBar {
                     NavigationBarItem(
-                        selected = tab == 0, onClick = { tab = 0 },
-                        icon = { Icon(Icons.Default.Download, null) }, label = { Text("تحميل") }
+                        selected = tab == MainActivity.TAB_BROWSER, onClick = { tab = MainActivity.TAB_BROWSER },
+                        icon = { Icon(Icons.Default.SmartDisplay, null) }, label = { Text("يوتيوب") }
                     )
                     NavigationBarItem(
-                        selected = tab == 1, onClick = { tab = 1 },
+                        selected = tab == MainActivity.TAB_LINK, onClick = { tab = MainActivity.TAB_LINK },
+                        icon = { Icon(Icons.Default.Link, null) }, label = { Text("رابط") }
+                    )
+                    NavigationBarItem(
+                        selected = tab == MainActivity.TAB_DOWNLOADS, onClick = { tab = MainActivity.TAB_DOWNLOADS },
                         icon = {
                             BadgedBox(badge = { if (activeCount > 0) Badge { Text("$activeCount") } }) {
                                 Icon(Icons.Default.DownloadDone, null)
@@ -150,8 +158,12 @@ fun SnapDownApp(activity: MainActivity) {
             snackbarHost = { SnackbarHost(snackbar) }
         ) { pad ->
             Box(Modifier.padding(pad).fillMaxSize()) {
-                if (tab == 0) HomeScreen(activity, snackbar, onOpenDownloads = { tab = 1 })
-                else DownloadsScreen(tasks)
+                val toDownloads = { tab = MainActivity.TAB_DOWNLOADS }
+                when (tab) {
+                    MainActivity.TAB_BROWSER -> BrowserScreen(activity, activity.browser, snackbar, toDownloads)
+                    MainActivity.TAB_LINK -> HomeScreen(activity, snackbar, toDownloads)
+                    else -> DownloadsScreen(tasks)
+                }
             }
         }
 
@@ -193,6 +205,7 @@ private fun HomeScreen(activity: MainActivity, snackbar: SnackbarHostState, onOp
             state = HomeState.Error(link, "الصق رابطًا صحيحًا يبدأ بـ https://"); return
         }
         url = l
+        if (Engine.isPurePlaylist(l)) { state = HomeState.Playlist(l); return }
         state = HomeState.Loading(l)
         scope.launch {
             state = try {
@@ -272,7 +285,7 @@ private fun HomeScreen(activity: MainActivity, snackbar: SnackbarHostState, onOp
         }
 
         when (val s = state) {
-            HomeState.Idle -> SitesGrid { u -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u))) }
+            HomeState.Idle -> SitesGrid { u -> activity.browser.open(u); activity.tab.intValue = MainActivity.TAB_BROWSER }
             is HomeState.Loading -> Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(); Spacer(Modifier.height(12.dp)); Text("جاري قراءة الرابط…")
@@ -293,7 +306,11 @@ private fun HomeScreen(activity: MainActivity, snackbar: SnackbarHostState, onOp
                     }
                 }
             }
-            is HomeState.Loaded -> InfoCard(s.info) { choice -> start(s.info.title, s.info.thumbnail, choice) }
+            is HomeState.Loaded -> {
+                InfoCard(s.info) { choice -> start(s.info.title, s.info.thumbnail, choice) }
+                if (Engine.playlistId(s.info.url) != null) PlaylistCard(s.info.url, snackbar, onOpenDownloads) { state = HomeState.Idle; url = "" }
+            }
+            is HomeState.Playlist -> PlaylistCard(s.url, snackbar, onOpenDownloads) { state = HomeState.Idle; url = "" }
         }
     }
 }
@@ -344,6 +361,37 @@ private fun InfoCard(info: MediaInfo, onChoose: (Choice) -> Unit) {
             Text("صوت", style = MaterialTheme.typography.titleSmall)
             FilledTonalButton(onClick = { onChoose(Choice("MP3", true, null)) }) {
                 Icon(Icons.Default.MusicNote, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("MP3 بأعلى جودة")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaylistCard(link: String, snackbar: SnackbarHostState, onOpenDownloads: () -> Unit, onStarted: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.PlaylistPlay, null); Spacer(Modifier.width(6.dp))
+                Text("تحميل قائمة التشغيل كاملة", fontWeight = FontWeight.Bold)
+            }
+            if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp)); Text("جاري قراءة القائمة…")
+            } else QualityButtons(enabled = true) { choice ->
+                busy = true
+                scope.launch {
+                    val msg = try {
+                        val n = Engine.enqueuePlaylist(Engine.playlistUrl(link), choice)
+                        "أُضيف $n فيديو للتحميل (${choice.label})"
+                    } catch (t: Throwable) {
+                        "تعذر قراءة القائمة: ${t.message?.take(120)}"
+                    }
+                    busy = false
+                    onStarted()
+                    if (snackbar.showSnackbar(msg, actionLabel = "عرض") == SnackbarResult.ActionPerformed) onOpenDownloads()
+                }
             }
         }
     }

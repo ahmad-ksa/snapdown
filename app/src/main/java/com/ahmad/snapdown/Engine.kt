@@ -127,6 +127,7 @@ object Engine {
         readyDeferred.await()
         val req = YoutubeDLRequest(url)
         req.addOption("--no-playlist")
+        cookiesFor(url)?.let { req.addOption("--cookies", it) }
         val info = YoutubeDL.getInstance().getInfo(req)
         val formats = info.formats ?: arrayListOf()
         val heights = formats
@@ -147,6 +148,97 @@ object Engine {
 
     fun hostOf(url: String): String =
         runCatching { Uri.parse(url).host?.removePrefix("www.")?.removePrefix("m.") }.getOrNull() ?: ""
+
+    fun isYouTube(url: String): Boolean {
+        val h = hostOf(url)
+        return h.endsWith("youtube.com") || h == "youtu.be" || h.endsWith("youtube-nocookie.com")
+    }
+
+    /** Playlist id from a YouTube link (watch?v=..&list=.. or playlist?list=..), ignoring auto mixes. */
+    fun playlistId(url: String): String? {
+        if (!isYouTube(url)) return null
+        val id = runCatching { Uri.parse(url).getQueryParameter("list") }.getOrNull() ?: return null
+        return id.takeIf { it.isNotBlank() }
+    }
+
+    /** True when the link is only a playlist/channel page (no single video in it). */
+    fun isPurePlaylist(url: String): Boolean {
+        val u = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val path = u.path ?: ""
+        if (isYouTube(url)) {
+            if (u.getQueryParameter("v") != null || path.startsWith("/shorts/") || hostOf(url) == "youtu.be") return false
+            return u.getQueryParameter("list") != null || path.startsWith("/@") || path.startsWith("/channel/") ||
+                path.startsWith("/c/") || path.startsWith("/user/")
+        }
+        return false
+    }
+
+    fun playlistUrl(url: String): String =
+        playlistId(url)?.let { "https://www.youtube.com/playlist?list=$it" } ?: url
+
+    data class Entry(val url: String, val title: String, val thumbnail: String?)
+
+    /** Reads all items of a playlist/channel quickly (without fetching every video). */
+    suspend fun fetchPlaylist(url: String): Pair<String, List<Entry>> = withContext(Dispatchers.IO) {
+        readyDeferred.await()
+        val req = YoutubeDLRequest(url)
+        req.addOption("--flat-playlist")
+        req.addOption("-J")
+        cookiesFor(url)?.let { req.addOption("--cookies", it) }
+        val root = JSONObject(YoutubeDL.getInstance().execute(req).out)
+        val list = mutableListOf<Entry>()
+        fun collect(arr: JSONArray?) {
+            if (arr == null) return
+            for (i in 0 until arr.length()) {
+                val e = arr.optJSONObject(i) ?: continue
+                // channels contain nested tabs (Videos / Shorts) that are playlists themselves
+                if (e.optString("_type") == "playlist" && e.has("entries")) { collect(e.optJSONArray("entries")); continue }
+                val title = e.optString("title")
+                if (title == "[Private video]" || title == "[Deleted video]") continue
+                val id = e.optString("id")
+                var u = e.optString("url").ifEmpty { e.optString("webpage_url") }
+                if (!u.startsWith("http") && id.isNotEmpty() && isYouTube(url)) u = "https://www.youtube.com/watch?v=$id"
+                if (!u.startsWith("http")) continue
+                val thumbs = e.optJSONArray("thumbnails")
+                val thumb = thumbs?.optJSONObject(thumbs.length() - 1)?.optString("url")?.ifEmpty { null }
+                    ?: if (isYouTube(u) && id.isNotEmpty()) "https://i.ytimg.com/vi/$id/hqdefault.jpg" else null
+                list += Entry(u, title.ifEmpty { id }, thumb)
+            }
+        }
+        collect(root.optJSONArray("entries"))
+        (root.optString("title").ifEmpty { "قائمة تشغيل" }) to list
+    }
+
+    /** Downloads every item of a playlist. Returns the number of queued videos. */
+    suspend fun enqueuePlaylist(url: String, choice: Choice): Int {
+        val (_, entries) = fetchPlaylist(url)
+        entries.forEach { enqueue(it.url, it.title, it.thumbnail, choice) }
+        return entries.size
+    }
+
+    /**
+     * Exports the in-app browser's cookies for this site to a Netscape cookie file,
+     * so private / login-only posts (Instagram, Facebook, X…) can be downloaded.
+     * YouTube is skipped on purpose: it works without login and cookies can trigger blocks.
+     */
+    fun cookiesFor(url: String): String? = runCatching {
+        if (isYouTube(url)) return null
+        val host = Uri.parse(url).host ?: return null
+        val parts = host.split('.')
+        val domain = if (parts.size >= 2) parts.takeLast(2).joinToString(".") else host
+        val raw = android.webkit.CookieManager.getInstance().getCookie("https://$domain")
+            ?: android.webkit.CookieManager.getInstance().getCookie(url)
+            ?: return null
+        val sb = StringBuilder("# Netscape HTTP Cookie File\n")
+        raw.split(';').map { it.trim() }.filter { it.contains('=') }.forEach {
+            val name = it.substringBefore('=')
+            val value = it.substringAfter('=')
+            sb.append(".$domain\tTRUE\t/\tTRUE\t2147483647\t$name\t$value\n")
+        }
+        val f = File(app.cacheDir, "cookies-$domain.txt")
+        f.writeText(sb.toString())
+        f.absolutePath
+    }.getOrNull()
 
     // ---------- downloads ----------
 
@@ -201,6 +293,7 @@ object Engine {
             val req = YoutubeDLRequest(task.url)
             req.addOption("--no-playlist")
             req.addOption("--no-mtime")
+            cookiesFor(task.url)?.let { req.addOption("--cookies", it) }
             req.addOption("-o", dir.absolutePath + "/%(title).80B [%(id)s].%(ext)s")
             if (task.audioOnly) {
                 req.addOption("-f", "ba/b")
