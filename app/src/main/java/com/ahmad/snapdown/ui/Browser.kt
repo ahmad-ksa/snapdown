@@ -37,6 +37,13 @@ import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -81,6 +88,7 @@ class BrowserState {
     var progress by mutableStateOf(100)
     var canGoBack by mutableStateOf(false)
     var webView: WebView? = null
+    val console = ArrayDeque<String>()
     private var pending: String? = null
 
     /** Opens a link in the in-app browser (works before the WebView exists too). */
@@ -104,20 +112,21 @@ val browserSites = listOf(
     "Vimeo" to "https://vimeo.com",
 )
 
-private const val CODEC_FIX_JS = """
-(function(){
-  if (window.__sdCodecFix) return; window.__sdCodecFix = true;
-  var bad = /hev1|hvc1|hevc|h265|bytevc1|dvh1|dvhe|av01/i;
-  try { if (window.MediaSource) { var ist = MediaSource.isTypeSupported.bind(MediaSource);
-    MediaSource.isTypeSupported = function(t){ return bad.test(t) ? false : ist(t); }; } } catch(e){}
-  try { var cpt = HTMLMediaElement.prototype.canPlayType;
-    HTMLMediaElement.prototype.canPlayType = function(t){ return bad.test(t) ? '' : cpt.call(this, t); }; } catch(e){}
-  try { if (navigator.mediaCapabilities) { var di = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
-    navigator.mediaCapabilities.decodingInfo = function(c){
-      var ct = (c && c.video && c.video.contentType) || '';
-      if (bad.test(ct)) return Promise.resolve({supported:false, smooth:false, powerEfficient:false});
-      return di(c); }; } } catch(e){}
-})();
+private const val DIAG_JS = """
+(function(){var r={};try{
+var vs=[].slice.call(document.querySelectorAll('video'));r.nVideo=vs.length;
+r.videos=vs.filter(function(v){return !v.paused||v.currentTime>0}).slice(0,3).map(function(v){var b=v.getBoundingClientRect(),cs=getComputedStyle(v);
+return{src:(v.currentSrc||'').slice(0,90),paused:v.paused,ready:v.readyState,w:v.videoWidth,h:v.videoHeight,t:Math.round(v.currentTime*10)/10,
+err:v.error?v.error.code+':'+v.error.message:null,box:[Math.round(b.left),Math.round(b.top),Math.round(b.width),Math.round(b.height)],
+vis:cs.visibility,op:cs.opacity,disp:cs.display,tf:cs.transform.slice(0,40),decoded:v.webkitDecodedFrameCount,
+frames:v.getVideoPlaybackQuality?v.getVideoPlaybackQuality().totalVideoFrames:null}});
+r.canvases=document.querySelectorAll('canvas').length;
+r.h264=window.MediaSource?MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001F"'):null;
+r.hevc=window.MediaSource?MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"'):null;
+var gl=document.createElement('canvas').getContext('webgl');r.webgl=!!gl;
+if(gl){var e=gl.getExtension('WEBGL_debug_renderer_info');r.gpu=e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):'?'}
+r.ua=navigator.userAgent.slice(0,140);
+}catch(x){r.jsErr=String(x)}return JSON.stringify(r)})()
 """
 
 /** Creates the WebView once; it survives tab switches so playback/page state is kept. */
@@ -136,11 +145,6 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
     CookieManager.getInstance().setAcceptCookie(true)
     CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-    // Many phones' WebView plays HEVC/AV1 audio but can't draw the frames (gray video on TikTok).
-    // Hide those codecs so sites fall back to H.264, which renders everywhere.
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-        WebViewCompat.addDocumentStartJavaScript(wv, CODEC_FIX_JS, setOf("*"))
-    }
 
     wv.webViewClient = object : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -156,9 +160,7 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             this@obtainWebView.url = url
-            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                view.evaluateJavascript(CODEC_FIX_JS, null)
-            }
+
         }
 
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
@@ -178,6 +180,15 @@ fun BrowserState.obtainWebView(activity: Activity): WebView {
     wv.webChromeClient = object : WebChromeClient() {
         override fun onProgressChanged(view: WebView, newProgress: Int) { progress = newProgress }
         override fun onReceivedTitle(view: WebView, t: String?) { title = t ?: "" }
+
+        override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
+            if (m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR ||
+                m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.WARNING) {
+                console.addLast("${m.messageLevel().name.take(1)}: ${m.message().take(160)}")
+                while (console.size > 25) console.removeFirst()
+            }
+            return true
+        }
 
         // no gray "play" placeholder while a video loads
         override fun getDefaultVideoPoster(): Bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
@@ -219,7 +230,7 @@ private const val DESKTOP_UA =
  * Returns true when the user agent was changed.
  */
 fun applyUserAgent(view: WebView, url: String): Boolean {
-    val wantDesktop = Engine.hostOf(url).endsWith("tiktok.com")
+    val wantDesktop = false // desktop TikTok made swiping impossible; mobile site everywhere
     val ua = if (wantDesktop) DESKTOP_UA else null
     val current = view.settings.userAgentString
     val isDesktop = current == DESKTOP_UA
@@ -256,6 +267,7 @@ fun BrowserScreen(activity: Activity, state: BrowserState, snackbar: SnackbarHos
     val scope = rememberCoroutineScope()
     var sheetFor by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var diag by remember { mutableStateOf<String?>(null) }
 
     BackHandler(enabled = state.canGoBack) { state.webView?.goBack() }
 
@@ -284,6 +296,22 @@ fun BrowserScreen(activity: Activity, state: BrowserState, snackbar: SnackbarHos
                     }
                 }
                 IconButton(onClick = { state.webView?.reload() }) { Icon(Icons.Default.Refresh, "تحديث") }
+                IconButton(onClick = {
+                    val wv = state.webView ?: return@IconButton
+                    wv.evaluateJavascript(DIAG_JS) { result ->
+                        val js = runCatching { org.json.JSONArray("[$result]").getString(0) }.getOrDefault(result ?: "null")
+                        val pkg = WebViewCompat.getCurrentWebViewPackage(activity)
+                        diag = buildString {
+                            appendLine("SnapDown diag")
+                            appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+                            appendLine("webview: ${pkg?.packageName} ${pkg?.versionName}")
+                            appendLine("url: ${state.url.take(150)}")
+                            appendLine("js: $js")
+                            appendLine("console:")
+                            state.console.forEach { appendLine(it) }
+                        }
+                    }
+                }) { Icon(Icons.Default.BugReport, "تشخيص") }
             }
             if (state.progress < 100) LinearProgressIndicator(progress = { state.progress / 100f }, modifier = Modifier.fillMaxWidth().height(2.dp))
             AndroidView(
@@ -302,6 +330,23 @@ fun BrowserScreen(activity: Activity, state: BrowserState, snackbar: SnackbarHos
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).navigationBarsPadding()
             )
         }
+    }
+
+    diag?.let { report ->
+        val clipboard = LocalClipboardManager.current
+        AlertDialog(
+            onDismissRequest = { diag = null },
+            title = { Text("تقرير التشخيص") },
+            text = {
+                SelectionContainer(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(report, style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { clipboard.setText(AnnotatedString(report)); diag = null }) { Text("نسخ") }
+            },
+            dismissButton = { TextButton(onClick = { diag = null }) { Text("إغلاق") } }
+        )
     }
 
     sheetFor?.let { pageUrl ->
